@@ -1,0 +1,316 @@
+#!/bin/sh
+#
+#  $Id: //depot/unix/tools/unixdb/elasticsearch/es-cli#11 $
+#  $Date: 2015/03/16 $
+#  $Author: jgriffin $
+#
+#  ElasticSearch Init Script
+#  https://gitlab.factset.com/nosql/ansible-playbooks/blob/master/es/roles/es/templates/es-cli.j2
+#######################################################################
+
+# EMAIL_ON_FAILURE={{ fds_init_email_on_failure }}
+# LOG_LOCATION={{ fds_init_log_location }}
+
+me=`whoami`
+    if [ "$me" != "es" ]; then
+      echo "Please run this init script as the es user"
+      exit 1
+    fi
+
+# SET INSTANCE SPECIFIC ENV VARIABLES
+
+#Running with fds_init_master?
+instance=`echo $0 | sed 's/.*\/[0-9]\+_es-\([a-z0-9_-]*\).*$/\1/'`
+
+if [ "$0" == "$instance" ]; then
+
+  #Must not be running from fds_init_master, maybe out of ~es/bin ?
+  instance=`echo $0 | sed 's/^.\+es-\([a-z]*\)/\1/'`
+
+  if [ "$0" == "$instance" ]; then
+    echo "Could not determine instance name from $0"
+    exit 1
+  fi 
+fi
+
+#Instance would be $0 (cli), if setting up grab $2
+#Instance would be $0 (cli), if setting up grab $2
+if [ "$1" == "setup" ]; then
+    if [ -z "$2" ]; then
+        echo "Please supply an instance name to setup."
+        echo "usage: $0 {start|stop|restart|monitor|status|setup <instance_name>}"
+        exit 1
+    fi
+
+    if [[ "$2" =~  ^es-* ]]; then
+        echo "Instance name shouldn't start with es"
+        exit 1
+    fi
+    
+    instance=$2
+    echo "Setting up new elasticsearch instance: $instance"
+fi
+
+es_home=/home/fds/es
+basedir=/home/fds/es/es-$instance
+vglv=/dev/mapper/vg$HOSTNAME-lves--$instance
+datalv=/dev/mapper/data-lves--$instance
+ssddatalv=/dev/mapper/vgssd-lves--$instance
+esdir="$basedir/elasticsearch"
+es_binary="$esdir/bin/elasticsearch"
+pidfile="$basedir/elasticsearch.pid"
+ES_LOG_PATH=$basedir/logs/
+ES_DATA_PATH=$basedir/data/
+ES_TMP_PATH=$basedir/tmp/
+ES_CONF_DIR=$basedir/etc
+config=$ES_CONF_DIR/elasticsearch.yml
+
+interface_name=`cat /etc/hosts |grep -v "^#\|localhost" | cut -f1 -d' '`
+
+export ES_MIN_MASTERS=2
+export ES_CLUSTER_NAME=$instance
+export ES_BASE_DIR=$basedir
+export ES_HOME_DIR=$es_home
+export ES_BIND_INTERFACE=$interface_name
+
+
+if [ ! -f /var/cfengine/classes/es_master -a ! -f /var/cfengine/classes/es_data ]; then
+  echo "No node role specified as cfengine class"
+  echo "touch either /var/cfengine/classes/es_master for a master node or /var/cfengine/classes/es_data for a data node"
+  exit 1
+fi
+
+# Dedicated master node per cfengine class
+if [ -f /var/cfengine/classes/es_master ]; then
+  export ES_MASTER="true"
+  export ES_DATA="false"
+fi
+
+# Dedicated data node per cfengine class
+if [ -f /var/cfengine/classes/es_data ]; then
+  export ES_MASTER="false"
+  export ES_DATA="true"
+fi
+
+if [ "$1" != "setup" ]; then
+  if [ ! -f "$basedir/etc/instance_conf" ]; then
+    echo "Config file does not exist for $instance, do you need to do setup?"
+    exit 1
+  fi
+  source $basedir/etc/instance_conf
+fi
+
+#######################################################################
+
+elasticsearch_usage() {
+    cat <<END
+usage: $0 {start|stop|restart|monitor|status|setup <instance_name>}
+END
+}
+
+elasticsearch_start() {
+
+    me=`whoami`
+    if [ "$me" != "es" ]; then
+      echo "Please run this init script as the es user"
+      exit 1
+    fi
+
+    elasticsearch_status
+    if [ $? -eq 0  ]; then
+      echo "ElasticSearch is already running"
+      return 0
+    fi
+
+    if [ "$ES_HTTP_PORT" == "9250" ]; then
+      echo "Default http port in $basedir/etc/instance_conf has not been changed, not starting"
+      exit 1
+    fi
+
+    if [ "$ES_TRAN_PORT" == "9350" ]; then
+      echo "Default transport port in $basedir/etc/instance_conf has not been changed, not starting"
+      exit 1
+    fi
+
+    stat=`stat $JAVA_HOME`
+    if [ $? -ne 0 ]; then
+      echo "Unable to find $JAVA_HOME path, not starting"
+      exit 1
+    fi
+
+    #TODO: Do cgroup?
+
+    # Actually start
+    sh -c "$es_binary -d -Des.config=$config -p $pidfile"
+
+    echo "ElasticSearch started"
+    return 0
+}
+
+elasticsearch_stop() {
+
+  elasticsearch_status
+  rc=$?
+  case "$rc" in
+    "0")
+      # Currently running. Normal, expected behavior.
+      echo "ElasticSearch is currently running"
+      ;;
+    "1")
+      # Currently not running. Nothing to do.
+      echo "ElasticSearch is already stopped"
+      return 0
+      ;;
+  esac
+
+  if [ ! -e $pidfile ]; then
+    echo "no pidfile"
+    return 0
+  fi
+
+  pid=`cat $pidfile 2> /dev/null`
+  /bin/kill $pid > /dev/null
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "ElasticSearch couldn't be stopped"
+    return 1
+  fi
+
+  shutdown_timeout=15
+  count=0
+  while [ $count -lt $shutdown_timeout ]; do
+    elasticsearch_status
+    rc=$?
+    if [ $rc -eq 4 ]; then
+      break
+    fi
+    count=`expr $count + 2`
+    sleep 2
+    echo "ElasticSearch still hasn't stopped yet. Waiting..."
+  done
+
+  elasticsearch_status
+  if [ $? -ne 4 ]; then
+    echo "ElasticSearch failed to stop after ${shutdown_timeout}s using SIGTERM. Trying SIGKILL..."
+    /bin/kill -KILL $pid > /dev/null
+  fi
+
+  echo "ElasticSearch stopped";
+  return 0
+}
+
+elasticsearch_status() {
+  if [ ! -e $pidfile ]; then
+    return 4
+  fi
+
+  pid=`cat $pidfile 2> /dev/null`
+  if [ -d /proc -a -d /proc/1 ]; then
+    [ "u$pid" != "u" -a -d /proc/$pid ]
+  else
+    kill -s 0 $pid >/dev/null 2>&1
+  fi
+
+  if [ $? -eq 0 ]; then
+    return 0
+  else
+    echo "ElasticSearch not running: removing old PID file"
+    rm -f $pidfile
+    return 1
+  fi
+}
+
+elasticsearch_monitor() {
+
+  elasticsearch_status
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    return $rc
+  fi
+
+  /usr/bin/nc -vz 127.0.0.1 $ES_HTTP_PORT 2> /dev/null
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "Failed to connect to elasticsearch";
+    return 1
+  fi
+
+  sh -c "echo \"GET /_cluster/health/status HTTP/1.1\n\" | /usr/bin/nc 127.0.0.1 $ES_HTTP_PORT"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "ElasticSearch GET /healthcheck did not return 200";
+    return 1
+  fi
+
+  echo "ElasticSearch monitor succeeded";
+  return 0
+}
+
+elasticsearch_setup() {
+
+  if [ ! -d $basedir ]; then
+    mkdir $basedir
+  fi
+
+  if [ ! -d $basedir/etc ]; then
+    mkdir $basedir/etc
+  fi
+
+  if [ ! -L $basedir/elasticsearch ]; then
+    latest_elasticsearch=`ls -d /home/fds/es/releases/{FDSelasticsearch,elasticsearch}* 2>/dev/null | sort -t. -k3 -n -r |head -1`
+    if [ ! -d $latest_elasticsearch ]; then
+      echo "elasticsearch release dir ($latest_elasticsearch) does not exist, Please Install FDSelasticsearch"
+      return 3
+    fi
+    ln -s $latest_elasticsearch $basedir/elasticsearch
+  fi
+
+  if [ ! -L /etc/fds/init.d/es/010_es-$instance.es.init  ]; then
+    ln -s $es_home/bin/es-cli /etc/fds/init.d/es/010_es-$instance.es.init
+  fi
+
+  if [ ! -L $es_home/bin/es-$instance ]; then
+    ln -s $es_home/bin/es-cli $es_home/bin/es-$instance
+  fi
+
+  if [ "$ES_MASTER" == "true" ]; then
+    if [ ! -d $basedir/data ]; then
+      mkdir $basedir/data
+    fi
+
+    if [ ! -d $basedir/logs ]; then
+      mkdir $basedir/logs
+    fi
+
+    if [ ! -d $basedir/tmp ]; then
+      mkdir $basedir/tmp
+    fi
+  else
+     
+  if [[ ! -b $vglv && ! -b $datalv && ! -b $ssddatalv ]]; then
+         echo "Corresponding LV not found. Please request unix team to create LV for this '$instance' instance"
+         exit 1
+   
+  elif [[ ! -d /data/es-$instance/data && ! -d /data/es-$instance/logs && ! -d /data/es-$instance/tmp ]]; then
+         echo "Please request unix team to create data,logs and tmp directories under /data/es-$instance and correct the permissions"
+         exit 1
+      
+  else
+ 
+       if [ ! -L $basedir/data ]; then
+         ln -s /data/es-$instance/data $basedir/data
+       fi
+
+       if [ ! -L $basedir/logs ]; then
+         ln -s /data/es-$instance/logs $basedir/logs
+       fi
+
+       if [ ! -L $basedir/tmp ]; then
+         ln -s /data/es-$instance/tmp $basedir/tmp
+       fi
+  fi
+  fi
+
+  if [ ! -e $basedir/etc/instance_conf ]; then
+    cp $es_home/etc/default_conf $basedir/etc/instance_conf
+  fi
